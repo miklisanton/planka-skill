@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 // Read-only Planka v1 client. Board/card endpoints only answer over the Sails
 // socket (plain HTTP returns 400), and the socket handshake requires an Origin header.
+import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
@@ -27,7 +30,7 @@ function die(msg) {
 
 if (typeof WebSocket === 'undefined' || !Map.groupBy) die(`Node 22+ required (running ${process.version})`);
 
-const LOGIN_HINT = `not logged in. In a terminal run: node ${import.meta.filename} login`;
+const LOGIN_HINT = `not logged in. Run \`node ${import.meta.filename} login\` in the background: it opens a login form in the browser and waits up to 5 minutes.`;
 
 function readToken() {
   if (process.env.PLANKA_TOKEN) return BASE ? process.env.PLANKA_TOKEN.trim() : die('PLANKA_TOKEN needs PLANKA_URL');
@@ -35,14 +38,14 @@ function readToken() {
 }
 
 async function ask(question) {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
   const answer = await rl.question(question);
   rl.close();
   return answer.trim();
 }
 
 function askHidden(question) {
-  process.stdout.write(question);
+  process.stderr.write(question);
   const { stdin } = process;
   stdin.setRawMode(true);
   stdin.resume();
@@ -56,7 +59,7 @@ function askHidden(question) {
           stdin.setRawMode(false);
           stdin.pause();
           stdin.off('data', onData);
-          process.stdout.write('\n');
+          process.stderr.write('\n');
           return resolve(input);
         }
         input = ch === '\u007f' ? input.slice(0, -1) : input + ch;
@@ -153,50 +156,137 @@ const date = (s) => (s ? s.slice(0, 10) : '');
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}…` : s);
 const cardUrl = (id) => `${BASE}/cards/${id}`;
 
-async function requestToken(email, password) {
-  const res = await fetch(`${BASE}/api/access-tokens`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ emailOrUsername: email, password }),
-  });
+// Returns null on bad credentials; throws on anything else (unreachable host, not Planka).
+async function requestToken(url, email, password) {
+  let res;
+  try {
+    res = await fetch(`${url}/api/access-tokens`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ emailOrUsername: email, password }),
+    });
+  } catch (e) {
+    throw new Error(`cannot reach ${url} (${e.cause?.code ?? e.message})`);
+  }
   const body = await res.json().catch(() => ({}));
   if (res.ok && body.item) return body.item;
   if (res.status === 401) return null;
-  die(`login failed: ${res.status} ${JSON.stringify(body)}`);
+  throw new Error(`${url} answered ${res.status}. Is it a Planka v1 server?`);
 }
 
-// Credentials come from args/env when given, otherwise from a TTY prompt.
-async function login(emailArg) {
-  const interactive = process.stdin.isTTY;
-  if (!interactive && !((emailArg || process.env.PLANKA_EMAIL) && process.env.PLANKA_PASSWORD)) die(LOGIN_HINT);
-  if (!BASE && !interactive) die('PLANKA_URL is required for non-interactive login');
-  BASE ??= normalizeUrl(await ask('Planka URL (e.g. planka.example.com): '));
-  if (interactive) console.log(`Logging in to ${BASE}`);
-  for (let attempt = 1; ; attempt++) {
-    const email = emailArg || process.env.PLANKA_EMAIL || (await ask('Email or username: '));
-    const password = process.env.PLANKA_PASSWORD || (await askHidden('Password: '));
-    const token = await requestToken(email, password);
+async function saveLogin(url, token) {
+  BASE = url;
+  mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(CONFIG_FILE, `${JSON.stringify({ url, token }, null, 2)}\n`, { mode: 0o600 });
+  const sock = new Socket(token);
+  await sock.open();
+  const me = (await sock.get('/users/me')).item;
+  sock.close();
+  console.error(`Logged in as ${me.name} (${me.email}). Saved to ${CONFIG_FILE}`);
+  return me;
+}
+
+async function loginFromEnv(email) {
+  if (!BASE) die('PLANKA_URL is required with PLANKA_PASSWORD');
+  const token = await requestToken(BASE, email, process.env.PLANKA_PASSWORD).catch((e) => die(e.message));
+  if (!token) die('invalid email or password');
+  await saveLogin(BASE, token);
+  return token;
+}
+
+async function loginInTerminal(emailArg) {
+  const url = BASE ?? normalizeUrl(await ask('Planka URL (e.g. planka.example.com): '));
+  console.error(`Logging in to ${url}`);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const email = emailArg || (await ask('Email or username: '));
+    const token = await requestToken(url, email, await askHidden('Password: ')).catch((e) => die(e.message));
     if (token) {
-      mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-      writeFileSync(CONFIG_FILE, `${JSON.stringify({ url: BASE, token }, null, 2)}\n`, { mode: 0o600 });
-      const sock = new Socket(token);
-      await sock.open();
-      const me = (await sock.get('/users/me')).item;
-      sock.close();
-      console.log(`Logged in as ${me.name} (${me.email}). Saved to ${CONFIG_FILE}`);
+      await saveLogin(url, token);
       return token;
     }
-    if (!interactive || process.env.PLANKA_PASSWORD || attempt === 3) die('invalid email or password');
-    console.log('Invalid email or password, try again.');
+    console.error('Invalid email or password, try again.');
   }
+  die('invalid email or password');
+}
+
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+function loginPage({ url = '', email = '', error = '', done = '' }) {
+  const body = done
+    ? `<h1>Planka</h1><p class="ok">${escapeHtml(done)}</p><p>You can close this tab.</p>`
+    : `<h1>Planka login</h1>
+${error ? `<p class="err">${escapeHtml(error)}</p>` : ''}
+<form method="post">
+<label>Planka URL<input name="url" value="${escapeHtml(url)}" placeholder="planka.example.com" required></label>
+<label>Email or username<input name="email" value="${escapeHtml(email)}" autocomplete="username" required autofocus></label>
+<label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+<button>Log in</button>
+</form>
+<p class="note">Credentials go straight to your Planka server. Only the token is saved, to ${escapeHtml(CONFIG_FILE)}.</p>`;
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Planka login</title>
+<style>
+body{font:15px system-ui,sans-serif;max-width:380px;margin:12vh auto;padding:0 16px;color:#1f2328;background:#fff}
+@media (prefers-color-scheme:dark){body{color:#e6edf3;background:#0d1117}input{background:#161b22;color:inherit;border-color:#30363d}}
+h1{font-size:20px}label{display:block;margin:12px 0}input{display:block;width:100%;box-sizing:border-box;margin-top:4px;padding:8px;font:inherit;border:1px solid #d0d7de;border-radius:6px}
+button{margin-top:8px;padding:8px 16px;font:inherit;border:0;border-radius:6px;background:#0969da;color:#fff;cursor:pointer}
+.err{color:#cf222e}.ok{color:#1a7f37}.note{font-size:13px;opacity:.7}
+</style>${body}`;
+}
+
+function openBrowser(url) {
+  const [cmd, args] = { darwin: ['open', [url]], win32: ['cmd', ['/c', 'start', '', url]] }[process.platform] ?? ['xdg-open', [url]];
+  spawn(cmd, args, { stdio: 'ignore', detached: true }).on('error', () => {}).unref();
+}
+
+// For agents without a TTY: a one-shot local form, guarded by a random key in its URL.
+function loginInBrowser() {
+  const key = randomBytes(16).toString('hex');
+  return new Promise((resolve) => {
+    const server = createServer(async (req, res) => {
+      const reqUrl = new URL(req.url, 'http://127.0.0.1');
+      const send = (status, page) => res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' }).end(page);
+      if (reqUrl.searchParams.get('k') !== key) return send(403, 'Forbidden');
+      if (req.method !== 'POST') return send(200, loginPage({ url: BASE ?? '' }));
+
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const form = new URLSearchParams(raw);
+      const url = normalizeUrl(form.get('url').trim());
+      const email = form.get('email').trim();
+      try {
+        const token = await requestToken(url, email, form.get('password'));
+        if (!token) return send(200, loginPage({ url, email, error: 'Invalid email or password.' }));
+        const me = await saveLogin(url, token);
+        res.on('finish', () => {
+          server.close();
+          server.closeAllConnections();
+          resolve(token);
+        });
+        send(200, loginPage({ done: `Logged in as ${me.name}.` }));
+      } catch (e) {
+        send(200, loginPage({ url, email, error: e.message }));
+      }
+    });
+    server.listen(0, '127.0.0.1', () => {
+      const url = `http://127.0.0.1:${server.address().port}/?k=${key}`;
+      console.log(`Open this page to log in to Planka (waiting 5 minutes):\n${url}`);
+      openBrowser(url);
+    });
+    setTimeout(() => die('login timed out after 5 minutes'), 5 * 60_000).unref();
+  });
+}
+
+function login(email = process.env.PLANKA_EMAIL) {
+  if (process.env.PLANKA_PASSWORD) return loginFromEnv(email);
+  return process.stdin.isTTY ? loginInTerminal(email) : loginInBrowser();
 }
 
 async function ensureToken() {
   const token = readToken();
   if (token) return token;
   if (!process.stdin.isTTY) die(LOGIN_HINT);
-  console.log('No Planka token found.');
-  return login();
+  console.error('No Planka token found.');
+  return loginInTerminal();
 }
 
 async function projects(sock, flags) {
@@ -368,7 +458,7 @@ async function notifications(sock, flags) {
 }
 
 const USAGE = `usage: planka.mjs <command> [--json]
-  login [email]                       prompts for credentials; saves token
+  login [email]                       terminal prompt, or a browser form when there is no TTY
   projects                            projects and their boards
   board <id|url> [--list NAME] [--mine] [--label NAME] [--search TEXT]
   card <id|url>                       description, tasks, attachments, comments

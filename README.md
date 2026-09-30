@@ -6,6 +6,6 @@ Agent skill for reading a self-hosted [Planka](https://github.com/plankanban/pla
 npx skills add miklisanton/planka-skill -g
 ```
 
-On first use, run `node ~/.claude/skills/planka/planka.mjs login` in a terminal. It asks for the Planka URL, email and password, and saves a token to `~/.config/planka/config.json`.
+On first use, ask your agent to log you in to Planka. It opens a login form in your browser for the Planka URL, email and password, and saves only a token to `~/.config/planka/config.json`. From a terminal, `node ~/.claude/skills/planka/planka.mjs login` prompts there instead.
 
 Needs Node 22+. No dependencies.

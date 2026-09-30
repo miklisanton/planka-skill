@@ -21,9 +21,15 @@ Run `node <this skill's dir>/planka.mjs <command>`. Output is markdown; add `--j
 
 ## Setup
 
-On first use the script prints `not logged in. In a terminal run: node …/planka.mjs login`. Relay that command to the user. Login is interactive: it asks for the Planka URL, email and a hidden password, then saves the URL and a non-expiring token to `~/.config/planka/config.json` (mode 600). The same prompt appears on any command run from a terminal with no config.
+On first use commands fail with `not logged in`. Log the user in yourself:
 
-Never ask for the password in chat or put it on a command line yourself. Non-interactive login exists for CI only (`PLANKA_URL`, `PLANKA_EMAIL`, `PLANKA_PASSWORD`); `PLANKA_URL` + `PLANKA_TOKEN` skip the config file.
+1. Run `node <this skill's dir>/planka.mjs login` in the background (it blocks until the form is submitted, up to 5 minutes).
+2. It opens a login form in the user's browser and prints its `http://127.0.0.1:<port>/?k=…` URL. Tell the user to fill it in, and give them the URL in case no browser opened.
+3. When it exits with `Logged in as …`, rerun the original command. On `login timed out`, offer to start it again.
+
+The form asks for the Planka URL, email and password, and sends them straight to the Planka server. Only the URL and a non-expiring token are saved, to `~/.config/planka/config.json` (mode 600). Run from a terminal, `login` prompts there instead.
+
+Never ask for the password in chat or put it on a command line yourself. `PLANKA_URL` + `PLANKA_EMAIL` + `PLANKA_PASSWORD` log in non-interactively (CI only); `PLANKA_URL` + `PLANKA_TOKEN` skip the config file.
 
 Requires Node 22+. Works with Planka v1 (Sails.js socket API).
 
