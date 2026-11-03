@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Read-only Planka v1 client. Board/card endpoints only answer over the Sails
+// Planka v1 client: reads, plus creating, editing, moving and deleting cards. Board/card endpoints only answer over the Sails
 // socket (plain HTTP returns 400), and the socket handshake requires an Origin header.
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -104,20 +104,36 @@ class Socket {
     });
   }
 
-  async get(path) {
+  async request(method, path, data = {}) {
     const id = this.seq++;
     const res = await new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      this.ws.send(`42${id}${JSON.stringify(['get', {
-        method: 'get',
+      this.ws.send(`42${id}${JSON.stringify([method, {
+        method,
         url: `/api${path}`,
         headers: { Authorization: `Bearer ${this.token}` },
-        data: {},
+        data,
       }])}`);
     });
     if (res.statusCode === 401) die('token rejected (401). Run login again.');
-    if (res.statusCode !== 200) die(`GET ${path} -> ${res.statusCode} ${JSON.stringify(res.body).slice(0, 200)}`);
+    if (res.statusCode !== 200) die(`${method.toUpperCase()} ${path} -> ${res.statusCode} ${JSON.stringify(res.body).slice(0, 200)}`);
     return res.body;
+  }
+
+  get(path) {
+    return this.request('get', path);
+  }
+
+  patch(path, data) {
+    return this.request('patch', path, data);
+  }
+
+  post(path, data) {
+    return this.request('post', path, data);
+  }
+
+  delete(path, data) {
+    return this.request('delete', path, data);
   }
 
   close() {
@@ -125,9 +141,12 @@ class Socket {
   }
 
   // Board and card responses omit users; project listing carries all of them.
+  async users() {
+    return (await this.get('/projects')).included.users;
+  }
+
   async userNames() {
-    const { included } = await this.get('/projects');
-    return new Map(included.users.map((u) => [u.id, u.name]));
+    return new Map((await this.users()).map((u) => [u.id, u.name]));
   }
 }
 
@@ -140,12 +159,17 @@ function idArg(arg, kind) {
   die(`not a ${kind} id or URL: ${arg}`);
 }
 
+const BOOLEAN_FLAGS = ['--json', '--mine', '--all', '--top', '--dry-run', '--yes'];
+const REPEATABLE_FLAGS = ['--label', '--member', '--add-label', '--remove-label', '--add-member', '--remove-member'];
+
 function parseFlags(argv) {
   const flags = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith('--')) flags._.push(a);
-    else if (['--json', '--mine', '--all'].includes(a)) flags[a.slice(2)] = true;
+    else if (BOOLEAN_FLAGS.includes(a)) flags[a.slice(2)] = true;
+    else if (i + 1 === argv.length) die(`${a} needs a value`);
+    else if (REPEATABLE_FLAGS.includes(a)) (flags[a.slice(2)] ??= []).push(argv[++i]);
     else flags[a.slice(2)] = argv[++i];
   }
   return flags;
@@ -326,7 +350,7 @@ function boardView(body, users, flags, me) {
   const q = flags.search?.toLowerCase();
   const keep = (c) =>
     (!flags.mine || c.memberIds.includes(me)) &&
-    (!flags.label || c.labels.some((l) => l.toLowerCase() === flags.label.toLowerCase())) &&
+    (!flags.label || c.labels.some((l) => flags.label.some((f) => l.toLowerCase() === f.toLowerCase()))) &&
     (!q || c.name.toLowerCase().includes(q));
 
   const lists = [...inc.lists]
@@ -430,6 +454,167 @@ async function card(sock, flags) {
   }
 }
 
+// Planka's own spacing between card positions; the server rebalances on collision.
+const POSITION_GAP = 65535;
+
+function findList(inc, boardName, target) {
+  return (
+    inc.lists.find((l) => l.id === target) ??
+    inc.lists.find((l) => l.name.toLowerCase() === target.toLowerCase()) ??
+    die(`no list "${target}" on board "${boardName}". Lists: ${inc.lists.map((l) => l.name).join(', ')}`)
+  );
+}
+
+function findLabel(inc, boardName, target) {
+  return (
+    inc.labels.find((l) => l.id === target) ??
+    inc.labels.find((l) => l.name?.toLowerCase() === target.toLowerCase()) ??
+    die(`no label "${target}" on board "${boardName}". Labels: ${inc.labels.map((l) => l.name).filter(Boolean).join(', ') || 'none'}`)
+  );
+}
+
+// "me", a user id, username, name or email. Board membership is checked by the server.
+function findUser(users, me, target) {
+  const t = target.replace(/^@/, '').toLowerCase();
+  if (t === 'me') return users.find((u) => u.id === me);
+  return (
+    users.find((u) => u.id === target) ??
+    users.find((u) => [u.username, u.name, u.email].some((v) => v?.toLowerCase() === t)) ??
+    die(`no user "${target}". Use a username, full name, email, or "me".`)
+  );
+}
+
+function positionInList(cards, listId, top, exceptId) {
+  const positions = cards.filter((x) => x.listId === listId && x.id !== exceptId).map((x) => x.position);
+  if (!positions.length) return POSITION_GAP;
+  return top ? Math.min(...positions) / 2 : Math.max(...positions) + POSITION_GAP;
+}
+
+// Planka rejects empty strings; an empty flag value clears the field.
+const textArg = (value) => (value.trim() ? value : null);
+
+function dueDateArg(value) {
+  if (!value.trim()) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) die(`not a date: ${value}. Use YYYY-MM-DD or an ISO timestamp.`);
+  return d.toISOString();
+}
+
+async function move(sock, flags) {
+  const id = idArg(flags._[1], 'card');
+  const target = flags._[2] || die('missing target list (name or id)');
+  const c = (await sock.get(`/cards/${id}`)).item;
+  const { item: b, included: inc } = await sock.get(`/boards/${c.boardId}`);
+  const list = findList(inc, b.name, target);
+  const from = inc.lists.find((l) => l.id === c.listId)?.name;
+  const position = positionInList(inc.cards, list.id, flags.top, id);
+
+  const summary = { id, name: c.name, board: b.name, from, to: list.name, position: flags.top ? 'top' : 'bottom' };
+  if (!flags['dry-run']) await sock.patch(`/cards/${id}`, { listId: list.id, position });
+  if (flags.json) return console.log(JSON.stringify({ ...summary, dryRun: !!flags['dry-run'] }, null, 2));
+  console.log(`${flags['dry-run'] ? 'would move' : 'moved'} "${c.name}": ${from} -> ${list.name} (${summary.position})`);
+}
+
+async function create(sock, flags, me) {
+  const boardId = idArg(flags._[1], 'board');
+  const target = flags._[2] || die('missing list (name or id)');
+  const name = flags._[3]?.trim() || die('missing card name');
+  const { item: b, included: inc } = await sock.get(`/boards/${boardId}`);
+  const list = findList(inc, b.name, target);
+  const labels = (flags.label ?? []).map((l) => findLabel(inc, b.name, l));
+  const users = flags.member ? await sock.users() : [];
+  const members = (flags.member ?? []).map((m) => findUser(users, me, m));
+
+  const data = { listId: list.id, name, position: positionInList(inc.cards, list.id, flags.top) };
+  if (flags.description) data.description = textArg(flags.description);
+  if (flags.due) data.dueDate = dueDateArg(flags.due);
+
+  let id = null;
+  if (!flags['dry-run']) {
+    // This server predates Planka's 2021 board-memberships release: cards are created on the board, not the list.
+    id = (await sock.post(`/boards/${b.id}/cards`, data)).item.id;
+    for (const l of labels) await sock.post(`/cards/${id}/labels`, { labelId: l.id });
+    for (const u of members) await sock.post(`/cards/${id}/memberships`, { userId: u.id });
+  }
+  const summary = {
+    id,
+    url: id && cardUrl(id),
+    name,
+    board: b.name,
+    list: list.name,
+    labels: labels.map((l) => l.name),
+    members: members.map((u) => u.name),
+    dueDate: data.dueDate ?? null,
+    dryRun: !!flags['dry-run'],
+  };
+  if (flags.json) return console.log(JSON.stringify(summary, null, 2));
+  const meta = [
+    summary.labels.length && `[${summary.labels.join(', ')}]`,
+    summary.members.length && `@${summary.members.join(', @')}`,
+    summary.dueDate && `due ${date(summary.dueDate)}`,
+  ].filter(Boolean).join('  ');
+  console.log(`${id ? 'created' : 'would create'} "${name}" in ${b.name} / ${list.name}${meta ? `  ${meta}` : ''}${id ? `\n${summary.url}` : ''}`);
+}
+
+async function edit(sock, flags, me) {
+  const id = idArg(flags._[1], 'card');
+  const c = (await sock.get(`/cards/${id}`)).item;
+  const { item: b, included: inc } = await sock.get(`/boards/${c.boardId}`);
+  const users = flags['add-member'] || flags['remove-member'] ? await sock.users() : [];
+
+  const patch = {};
+  const changes = [];
+  if (flags.name !== undefined && flags.name.trim() !== c.name) {
+    patch.name = flags.name.trim() || die('--name cannot be empty');
+    changes.push(`name: "${c.name}" -> "${patch.name}"`);
+  }
+  if (flags.description !== undefined && textArg(flags.description) !== (c.description ?? null)) {
+    patch.description = textArg(flags.description);
+    changes.push(patch.description === null ? 'description: cleared' : `description: replaced (${patch.description.length} chars)`);
+  }
+  if (flags.due !== undefined && dueDateArg(flags.due) !== (c.dueDate ?? null)) {
+    patch.dueDate = dueDateArg(flags.due);
+    changes.push(`due: ${date(c.dueDate) || 'none'} -> ${date(patch.dueDate) || 'none'}`);
+  }
+
+  const labelIds = new Set(inc.cardLabels.filter((x) => x.cardId === id).map((x) => x.labelId));
+  const memberIds = new Set(inc.cardMemberships.filter((x) => x.cardId === id).map((x) => x.userId));
+  const addLabels = (flags['add-label'] ?? []).map((l) => findLabel(inc, b.name, l)).filter((l) => !labelIds.has(l.id));
+  const removeLabels = (flags['remove-label'] ?? []).map((l) => findLabel(inc, b.name, l)).filter((l) => labelIds.has(l.id));
+  const addMembers = (flags['add-member'] ?? []).map((m) => findUser(users, me, m)).filter((u) => !memberIds.has(u.id));
+  const removeMembers = (flags['remove-member'] ?? []).map((m) => findUser(users, me, m)).filter((u) => memberIds.has(u.id));
+  changes.push(
+    ...addLabels.map((l) => `+label ${l.name}`),
+    ...removeLabels.map((l) => `-label ${l.name}`),
+    ...addMembers.map((u) => `+member ${u.name}`),
+    ...removeMembers.map((u) => `-member ${u.name}`),
+  );
+
+  if (!flags['dry-run']) {
+    if (Object.keys(patch).length) await sock.patch(`/cards/${id}`, patch);
+    for (const l of addLabels) await sock.post(`/cards/${id}/labels`, { labelId: l.id });
+    for (const l of removeLabels) await sock.delete(`/cards/${id}/labels/${l.id}`);
+    for (const u of addMembers) await sock.post(`/cards/${id}/memberships`, { userId: u.id });
+    for (const u of removeMembers) await sock.delete(`/cards/${id}/memberships`, { userId: u.id });
+  }
+  if (flags.json) return console.log(JSON.stringify({ id, url: cardUrl(id), name: c.name, changes, dryRun: !!flags['dry-run'] }, null, 2));
+  if (!changes.length) return console.log(`no changes to "${c.name}"`);
+  console.log(`${flags['dry-run'] ? 'would update' : 'updated'} "${c.name}" ${cardUrl(id)}`);
+  for (const line of changes) console.log(`- ${line}`);
+}
+
+// Deleting is permanent, so it needs --yes; without it the command only describes the card.
+async function remove(sock, flags) {
+  const id = idArg(flags._[1], 'card');
+  const c = (await sock.get(`/cards/${id}`)).item;
+  const { item: b, included: inc } = await sock.get(`/boards/${c.boardId}`);
+  const where = `${b.name} / ${inc.lists.find((l) => l.id === c.listId)?.name}`;
+  const apply = flags.yes && !flags['dry-run'];
+  if (apply) await sock.delete(`/cards/${id}`);
+  if (flags.json) return console.log(JSON.stringify({ id, name: c.name, where, deleted: !!apply }, null, 2));
+  console.log(apply ? `deleted "${c.name}" from ${where}` : `would delete "${c.name}" from ${where}. This cannot be undone. Rerun with --yes to delete.`);
+}
+
 async function notifications(sock, flags) {
   const { items, included = {} } = await sock.get('/notifications');
   const cards = byId(included.cards);
@@ -462,18 +647,28 @@ const USAGE = `usage: planka.mjs <command> [--json]
   projects                            projects and their boards
   board <id|url> [--list NAME] [--mine] [--label NAME] [--search TEXT]
   card <id|url>                       description, tasks, attachments, comments
-  notifications [--all]               unread by default`;
+  notifications [--all]               unread by default
+  move <card id|url> <list name|id> [--top] [--dry-run]
+                                      move a card to another list on its board (bottom by default)
+  create <board id|url> <list name|id> <name> [--description TEXT] [--due DATE]
+         [--label NAME]... [--member USER]... [--top] [--dry-run]
+  edit <card id|url> [--name TEXT] [--description TEXT] [--due DATE]
+       [--add-label NAME]... [--remove-label NAME]... [--add-member USER]... [--remove-member USER]... [--dry-run]
+                                      an empty --description or --due clears it; USER is a username, name, email or "me"
+  delete <card id|url> --yes          permanent; without --yes only shows what would be deleted`;
+
+const COMMANDS = { projects, board, card, notifications, move, create, edit, delete: remove };
 
 const flags = parseFlags(process.argv.slice(2));
 const cmd = flags._[0];
 if (cmd === 'login') {
   await login(flags._[1]);
-} else if (['projects', 'board', 'card', 'notifications'].includes(cmd)) {
+} else if (Object.hasOwn(COMMANDS, cmd)) {
   const token = await ensureToken();
   const sock = new Socket(token);
   await sock.open();
   try {
-    const run = { projects, board, card, notifications }[cmd];
+    const run = COMMANDS[cmd];
     await run(sock, flags, userIdFromToken(token));
   } finally {
     sock.close();
