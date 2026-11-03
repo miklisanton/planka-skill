@@ -1,6 +1,6 @@
 # planka-skill
 
-Agent skill for reading a self-hosted [Planka](https://github.com/plankanban/planka) v1 kanban: projects, boards, cards with checklists and comments, and notifications. Read-only.
+Agent skill for a self-hosted [Planka](https://github.com/plankanban/planka) v1 kanban: read projects, boards, cards with checklists and comments, and notifications; create, edit, move and delete cards. The skill tells the agent to change cards only when the user asks for that change.
 
 ```
 npx skills add miklisanton/planka-skill -g
